@@ -8,8 +8,8 @@ def main():
     # 页面全局配置
     st.set_page_config(page_title="A-Scholar 智研导师", layout="wide", page_icon="🎓")
 
-    if not check_password():
-        st.stop()
+    # if not check_password():
+    #     st.stop()
 
     # 侧边栏
     with st.sidebar:

@@ -12,7 +12,6 @@ import dashscope
 from dashscope.audio.qwen_tts_realtime import *
 from dashscope.audio.asr import Recognition
 import streamlit as st
-from openai import OpenAI
 from pydub import AudioSegment
 
 from utils.logger import *
@@ -37,11 +36,23 @@ def transcribe_audio(audio_bytes):
     temp_path = None
 
     try:
+        # 先读取浏览器录音
+        audio = AudioSegment.from_file(io.BytesIO(audio_bytes))
+
+        # 转成阿里云需要的格式
+        audio = (
+            audio
+            .set_frame_rate(16000)  # 16k
+            .set_channels(1)  # 单声道
+            .set_sample_width(2)  # 16bit PCM
+        )
+
+        # 保存为真正标准 wav
         with tempfile.NamedTemporaryFile(
-            delete=False,
-            suffix=".wav"
+                delete=False,
+                suffix=".wav"
         ) as f:
-            f.write(audio_bytes)
+            audio.export(f.name, format="wav")
             temp_path = f.name
 
         recognition = Recognition(model='paraformer-realtime-v2',
@@ -54,14 +65,25 @@ def transcribe_audio(audio_bytes):
         result = recognition.call(temp_path)
 
         if result.status_code == HTTPStatus.OK:
-            return result.get_sentence()
+            logger.info(result)
+            logger.info(type(result))
+            logger.info(result.output)
+            output = result.output or {}
 
-        logger.warning("ASR Error:", result.message)
-        return None
+            sentences = output.get("sentence", [])
 
-    except Exception as e:
-        logger.exception(f"阿里ASR失败: {e}")
-        return None
+            text_parts = []
+
+            for s in sentences:
+                txt = s.get("text", "").strip()
+                if txt:
+                    text_parts.append(txt)
+
+            final_text = " ".join(text_parts).strip()
+
+            logger.info(f"ASR最终结果: {final_text}")
+
+            return final_text if final_text else None
 
     finally:
         if temp_path and os.path.exists(temp_path):

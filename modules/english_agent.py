@@ -166,12 +166,10 @@ class EnglishLinguaApp:
         with col_text:
             text_input = st.chat_input("Type here or use mic...")
         with col_mic:
-            # 【重要修复 1】: 强制指定 sample_rate=16000，否则阿里云听不懂浏览器录的音
             audio_bytes = audio_recorder(
                 text="",
                 icon_name="microphone",
-                key="main_mic",
-                sample_rate=16000
+                key="main_mic"
             )
 
         user_text = None
@@ -184,18 +182,19 @@ class EnglishLinguaApp:
         elif audio_bytes and len(audio_bytes) != st.session_state.last_audio_len:
             st.session_state.last_audio_len = len(audio_bytes)  # 更新记录
 
+            st.audio(audio_bytes)
             with st.spinner("Recognizing... (识别中)"):
                 user_text = transcribe_audio(audio_bytes)
                 user_audio = audio_bytes
 
                 # 【重要修复 3】: 如果阿里云没听清返回了空，给用户一个提示
-                if not user_text or user_text.strip() == "":
+                if not user_text:
                     st.warning("⚠️ 未能识别到声音，请大点声或检查麦克风权限。")
                     user_text = None  # 确保为 None，不往下走
 
         if user_text:
             # 1. 存入历史
-            self.db.state.vocab_bank.update(user_text.split())
+            self.db.state.vocab_bank.update(user_text)
             st.session_state.lingua_history.append({
                 "role": "user",
                 "content_en": user_text,
