@@ -1,0 +1,9 @@
+audio_recorder_streamlit==0.0.10
+av==17.0.1
+dashscope==1.25.18
+loguru==0.7.3
+numpy==2.2.6
+openai==2.36.0
+pydub==0.25.1
+streamlit==1.57.0
+websockets==16.0
