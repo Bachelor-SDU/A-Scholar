@@ -1,5 +1,6 @@
 # modules/english_agent.py
 import streamlit as st
+from concurrent.futures import ThreadPoolExecutor
 from audio_recorder_streamlit import audio_recorder
 
 from utils.nlp_agents import EnglishAgents, UserDataStore
@@ -266,6 +267,10 @@ class EnglishLinguaApp:
             })
 
             st.session_state.pending_user_text = user_text
+            if "tts_future" not in st.session_state:
+                st.session_state.tts_future = None
+            if "diag_future" not in st.session_state:
+                st.session_state.diag_future = None
             st.session_state.agent_stage = "waiting_llm"
 
             st.rerun()
@@ -316,77 +321,147 @@ class EnglishLinguaApp:
                 st.session_state.pending_reply_en = reply_en
 
                 # 下一阶段
-                st.session_state.agent_stage = "waiting_tts"
+                st.session_state.agent_stage = "waiting_background_tasks"
 
                 st.rerun()
         # =========================
         # 第二阶段：生成TTS
         # =========================
-        elif stage == "waiting_tts":
+        elif stage == "waiting_background_tasks":
 
-            with st.spinner("Generating Voice..."):
+            with st.spinner("Finishing response..."):
 
                 reply_en = st.session_state.pending_reply_en
 
-                try:
-                    reply_audio = generate_audio_reply(
-                        reply_en,
-                        "Cherry"
-                    )
-                except Exception as e:
-                    logger.error(f"TTS失败: {e}")
-                    reply_audio = None
+                # 找最近用户消息
+                user_text = None
 
-                # 更新最后一条AI消息
+                for i in range(len(st.session_state.lingua_history) - 1, -1, -1):
+                    if st.session_state.lingua_history[i]["role"] == "user":
+                        user_text = st.session_state.lingua_history[i]["content_en"]
+                        user_index = i
+                        break
+
+                history_for_chat = []
+
+                for m in st.session_state.lingua_history:
+                    history_for_chat.append({
+                        "role": m["role"],
+                        "content": m["content_en"]
+                    })
+
+                # =========================
+                # 并行执行
+                # =========================
+
+                with ThreadPoolExecutor(max_workers=2) as executor:
+
+                    future_tts = executor.submit(
+                        self._run_tts_task,
+                        reply_en
+                    )
+
+                    future_diag = executor.submit(
+                        self._run_diag_task,
+                        user_text,
+                        history_for_chat
+                    )
+
+                    # 获取结果
+                    reply_audio = future_tts.result()
+
+                    diag_res = future_diag.result()
+
+                # =========================
+                # 更新TTS
+                # =========================
+
                 st.session_state.lingua_history[-1]["audio"] = reply_audio
 
-                # 下一阶段
-                st.session_state.agent_stage = "waiting_diag"
+                # =========================
+                # 更新诊断
+                # =========================
 
-                st.rerun()
-        # =========================
-        # 第三阶段：诊断
-        # =========================
-        elif stage == "waiting_diag":
+                if diag_res:
+                    st.session_state.diagnostics[user_index] = diag_res
 
-            with st.spinner("Analyzing Grammar..."):
-
-                try:
-
-                    user_index = None
-
-                    for i in range(len(st.session_state.lingua_history) - 1, -1, -1):
-                        if st.session_state.lingua_history[i]["role"] == "user":
-                            user_index = i
-                            break
-
-                    if user_index is not None:
-
-                        user_text = st.session_state.lingua_history[user_index]["content_en"]
-
-                        history_for_chat = []
-
-                        for m in st.session_state.lingua_history:
-                            history_for_chat.append({
-                                "role": m["role"],
-                                "content": m["content_en"]
-                            })
-
-                        diag_res = EnglishAgents.diagnostic_agent(
-                            user_text,
-                            history_for_chat
-                        )
-
-                        if diag_res:
-                            st.session_state.diagnostics[user_index] = diag_res
-
-                except Exception as e:
-                    logger.error(f"诊断失败: {e}")
-
-                # 全部完成
+                # 完成
                 st.session_state.agent_stage = None
 
                 st.rerun()
+
+    def _run_tts_task(self, reply_en):
+
+        try:
+            audio = generate_audio_reply(reply_en, "Cherry")
+            return audio
+
+        except Exception as e:
+            logger.error(f"TTS失败: {e}")
+            return None
+
+    def _run_diag_task(self, user_text, history):
+
+        try:
+            diag_res = EnglishAgents.diagnostic_agent(
+                user_text,
+                history
+            )
+            return diag_res
+
+        except Exception as e:
+            logger.error(f"Diagnostic失败: {e}")
+            return None
+
+    def _poll_background_tasks(self):
+
+        # =========================
+        # 检查 TTS
+        # =========================
+
+        tts_future = st.session_state.get("tts_future")
+
+        if tts_future and tts_future.done():
+
+            try:
+                audio = tts_future.result()
+
+                idx = st.session_state.tts_target_index
+
+                # 仅更新一次
+                if (
+                        st.session_state.lingua_history[idx]["audio"]
+                        is None
+                ):
+                    st.session_state.lingua_history[idx]["audio"] = audio
+
+            except Exception as e:
+                logger.error(f"TTS Future失败: {e}")
+
+            finally:
+                st.session_state.tts_future = None
+
+        # =========================
+        # 检查 Diagnostic
+        # =========================
+
+        diag_future = st.session_state.get("diag_future")
+
+        if diag_future and diag_future.done():
+
+            try:
+                diag_res = diag_future.result()
+
+                idx = st.session_state.diag_target_index
+
+                if diag_res:
+                    st.session_state.diagnostics[idx] = diag_res
+
+            except Exception as e:
+                logger.error(f"Diagnostic Future失败: {e}")
+
+            finally:
+                st.session_state.diag_future = None
 
     def run(self):
         """主入口"""
