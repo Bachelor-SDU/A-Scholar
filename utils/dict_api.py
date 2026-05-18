@@ -1,87 +1,231 @@
 # utils/dict_api.py
-import requests
-import hashlib
+
+import random
 import time
-import uuid
-import streamlit as st
-from utils.logger import logger  # 引入我们之前写好的 loguru 日志
+from functools import lru_cache
+
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+from utils.logger import logger
 
 
-def encrypt_youdao_sign(app_key, app_secret, q, salt, curtime):
-    """生成有道API所需的签名"""
+# ==========================================
+# Session 全局复用
+# ==========================================
 
-    def truncate(q):
-        if q is None: return None
-        size = len(q)
-        return q if size <= 20 else q[0:10] + str(size) + q[size - 10:size]
+session = requests.Session()
 
-    sign_str = app_key + truncate(q) + salt + curtime + app_secret
-    hash_algorithm = hashlib.sha256()
-    hash_algorithm.update(sign_str.encode('utf-8'))
-    return hash_algorithm.hexdigest()
+retry_strategy = Retry(
+    total=3,
+    backoff_factor=0.5,
+    status_forcelist=[429, 500, 502, 503, 504],
+)
+
+adapter = HTTPAdapter(max_retries=retry_strategy)
+
+session.mount("https://", adapter)
+session.mount("http://", adapter)
 
 
-def lookup_word_youdao(word):
+# ==========================================
+# 请求头池（防反爬）
+# ==========================================
+
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)",
+    "Mozilla/5.0 (X11; Linux x86_64)",
+]
+
+
+def get_headers():
+    return {
+        "User-Agent": random.choice(USER_AGENTS),
+        "Referer": "https://dict.youdao.com/",
+        "Accept": "application/json,text/plain,*/*",
+        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+    }
+
+
+# ==========================================
+# 工具函数
+# ==========================================
+
+def safe_get(d, *keys, default=None):
     """
-    调用有道词典 API 查词
-    返回标准化字典，如果查询失败返回 None
+    安全获取嵌套字典字段
     """
-    app_key = st.secrets.get("YOUDAO_APP_KEY")
-    app_secret = st.secrets.get("YOUDAO_APP_SECRET")
+    for key in keys:
+        try:
+            d = d[key]
+        except (KeyError, IndexError, TypeError):
+            return default
+    return d
 
-    if not app_key or not app_secret:
-        logger.error("未配置有道词典 API Key！")
+
+# ==========================================
+# 解析释义
+# ==========================================
+
+def parse_explains(word_info):
+    explains = []
+
+    trs = word_info.get("trs", [])
+
+    for tr in trs:
+        try:
+            text = tr["tr"][0]["l"]["i"][0]
+            explains.append(text)
+        except Exception:
+            continue
+
+    return explains
+
+
+# ==========================================
+# 解析例句
+# ==========================================
+
+def parse_sentences(data):
+    result = []
+
+    sentence_data = (
+        data.get("blng_sents_part", {})
+        .get("sentence-pair", [])
+    )
+
+    for item in sentence_data[:5]:
+        result.append({
+            "en": item.get("sentence", ""),
+            "zh": item.get("sentence-translation", "")
+        })
+
+    return result
+
+
+# ==========================================
+# 解析短语
+# ==========================================
+
+def parse_phrases(data):
+    phrases = []
+
+    phrase_data = (
+        data.get("phrase", {})
+        .get("phrases", [])
+    )
+
+    for item in phrase_data[:10]:
+        phrases.append({
+            "phrase": item.get("p", ""),
+            "translation": item.get("t", "")
+        })
+
+    return phrases
+
+
+# ==========================================
+# 主查词函数
+# ==========================================
+
+@lru_cache(maxsize=2048)
+def lookup_word_youdao(word: str):
+    """
+    有道词典网页版接口
+    """
+
+    if not word:
         return None
 
-    # 请求参数构造
-    q = word.strip()
-    salt = str(uuid.uuid1())
-    curtime = str(int(time.time()))
-    sign = encrypt_youdao_sign(app_key, app_secret, q, salt, curtime)
+    word = word.strip()
+
+    url = "https://dict.youdao.com/jsonapi"
 
     params = {
-        'q': q,
-        'from': 'en',
-        'to': 'zh-CHS',
-        'appKey': app_key,
-        'salt': salt,
-        'sign': sign,
-        'signType': 'v3',
-        'curtime': curtime,
+        "q": word
     }
 
     try:
-        response = requests.get('https://openapi.youdao.com/api', params=params, timeout=5)
-        res_json = response.json()
+        # ==================================
+        # 随机延迟（防频繁）
+        # ==================================
+        time.sleep(random.uniform(0.1, 0.4))
 
-        # 错误码判断 (0 代表成功)
-        if res_json.get("errorCode") != "0":
-            logger.warning(f"有道API返回错误码: {res_json.get('errorCode')}")
+        response = session.get(
+            url,
+            params=params,
+            headers=get_headers(),
+            timeout=(5, 10)
+        )
+
+        response.raise_for_status()
+
+        data = response.json()
+
+        # ==================================
+        # 英汉词典主数据
+        # ==================================
+        word_info = safe_get(
+            data,
+            "ec",
+            "word",
+            0,
+            default={}
+        )
+
+        if not word_info:
+            logger.warning(f"未找到单词: {word}")
             return None
 
-        # --- 核心：解析返回的数据，重构为前端好用的格式 ---
-        # 基础翻译
-        translation = res_json.get("translation", [])
+        explains = parse_explains(word_info)
 
-        # 词典扩展数据 (包含音标、发音等)
-        basic = res_json.get("basic", {})
+        result = {
+            # 基础
+            "word": word,
 
-        parsed_data = {
-            "word": q,
-            "translation": translation,
-            "uk_phonetic": basic.get("uk-phonetic", ""),
-            "us_phonetic": basic.get("us-phonetic", ""),
-            # 发音 MP3 链接
-            "uk_speech": basic.get("uk-speech", ""),
-            "us_speech": basic.get("us-speech", ""),
-            # 详细释义
-            "explains": basic.get("explains", []),
-            # 词汇级别标签 (如: 考研, CET4)
-            "exam_type": basic.get("exam_type", [])
+            # 音标
+            "uk_phonetic":
+                word_info.get("ukphone", ""),
+
+            "us_phonetic":
+                word_info.get("usphone", ""),
+
+            # 发音
+            "uk_speech":
+                f"https://dict.youdao.com/dictvoice?audio={word}&type=1",
+
+            "us_speech":
+                f"https://dict.youdao.com/dictvoice?audio={word}&type=2",
+
+            # 释义
+            "translation": explains,
+            "explains": explains,
+
+            # 等级
+            "exam_type":
+                word_info.get("exam_type", []),
+
+            # 例句
+            "sentences":
+                parse_sentences(data),
+
+            # 短语
+            "phrases":
+                parse_phrases(data),
         }
 
-        return parsed_data
+        return result
+
+    except requests.exceptions.Timeout:
+        logger.warning(f"查词超时: {word}")
+        return None
+
+    except requests.exceptions.HTTPError as e:
+        logger.warning(f"HTTP错误: {e}")
+        return None
 
     except Exception as e:
-        logger.exception(f"查词接口调用异常: {e}")
+        logger.exception(f"查词失败: {e}")
         return None

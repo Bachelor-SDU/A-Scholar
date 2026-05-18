@@ -7,6 +7,7 @@ from utils.nlp_agents import EnglishAgents, UserDataStore
 from utils.audio_client import transcribe_audio, generate_audio_reply
 from utils.dict_api import lookup_word_youdao
 from utils.logger import logger
+from prompts.english_prompts import PRACTICE_SCENARIOS
 
 
 class EnglishLinguaApp:
@@ -14,123 +15,180 @@ class EnglishLinguaApp:
         self.init_state()
 
     def init_state(self):
+        if "current_tab" not in st.session_state:
+            st.session_state.current_tab = "💬 对话"
         if "lingua_history" not in st.session_state:
-            greeting_en = "Hey there! How's your day going?"
-            greeting_zh = "嗨！今天过得怎么样？"
-            audio_bytes = generate_audio_reply(greeting_en)
+            # 默认使用情景库中的第一个作为初始对话
+            first_category = list(PRACTICE_SCENARIOS.keys())[0]
+            default_scenario = PRACTICE_SCENARIOS[first_category][0]
 
-            st.session_state.lingua_history = [{
-                "role": "assistant",
-                "content_en": greeting_en,
-                "content_zh": greeting_zh,
-                "audio": audio_bytes,
-                "played": False
-            }]
-            st.session_state.hints = []
+            # 初始化全局线程池
+            st.session_state.thread_pool = ThreadPoolExecutor(max_workers=3)
+
+            # 内部调用场景加载器 (传入 is_init=True 防止系统启动时陷入无限 rerun)
+            self._load_scenario(
+                system_prompt=default_scenario["system_prompt"],
+                first_msg_en=default_scenario["first_message_en"],
+                first_msg_zh=default_scenario["first_message_zh"],
+                scenario_title=default_scenario["title"],
+                is_init=True
+            )
+
+    def _load_scenario(self, system_prompt, first_msg_en, first_msg_zh, scenario_title, is_init=False):
+        """重置聊天记录并加载特定场景"""
+        with st.spinner(f"正在构建情景: {scenario_title}..."):
+            # 生成第一句话的语音
+            audio_bytes = generate_audio_reply(first_msg_en)
+
+            # 彻底重置所有历史记录和控制状态
+            st.session_state.lingua_history = [
+                {
+                    "role": "system",
+                    "content_en": system_prompt,
+                    "content_zh": "",
+                    "audio": None,
+                    "played": True
+                },
+                {
+                    "role": "assistant",
+                    "content_en": first_msg_en,
+                    "content_zh": first_msg_zh,
+                    "audio": audio_bytes,
+                    "played": False  # 置为 False 确保切换面板后自动播放
+                }
+            ]
+
+            # 🧹 彻底清理各种并发状态和缓存，防止切换场景导致的状态污染
             st.session_state.diagnostics = {}
+            st.session_state.hints = []
+            st.session_state.agent_stage = None
+            st.session_state.pending_user_text = None
+            st.session_state.diag_future = None
+            st.session_state.tts_future = None
+
+        if not is_init:
+            st.session_state.switch_to_chat = True
+            st.rerun()
+
+    def render_practice_tab(self):
+        st.markdown("### 🎯 沉浸式情景练习")
+        st.info("💡 点击任意情景卡片，AI 将会自动扮演相应角色并重置当前的对话面板。")
+
+        # 渲染预设的三大板块
+        for category, scenarios in PRACTICE_SCENARIOS.items():
+            st.markdown(f"#### {category}")
+            # 使用列来实现卡片式布局
+            cols = st.columns(len(scenarios))
+            for idx, sc in enumerate(scenarios):
+                with cols[idx]:
+                    # 利用 container 画个边框
+                    with st.container(border=True):
+                        st.markdown(f"**{sc['title']}**")
+                        st.caption(sc['desc'])
+                        if st.button("▶️ 开始此情景", key=f"btn_{sc['id']}", use_container_width=True):
+                            self._load_scenario(
+                                sc["system_prompt"],
+                                sc["first_message_en"],
+                                sc["first_message_zh"],
+                                sc["title"]
+                            )
+            st.write("")  # 留白
+
+        st.divider()
+
+        # 渲染【自定义情景】板块
+        st.markdown("#### 🛠️ 自定义情景")
+        with st.expander("构建你自己的练习剧本..."):
+            with st.form("custom_scenario_form"):
+                st.write("告诉AI你们分别是谁，以及正在发生什么：")
+                custom_role = st.text_input("AI的角色设定 (例如：你是一位纽约的街头艺人，性格开朗...)",
+                                            placeholder="You are a...")
+                custom_context = st.text_area("场景与你的任务 (例如：我在纽约旅游，想问你这附近有没有好吃的披萨店...)",
+                                              placeholder="The user is a tourist who wants to...")
+                custom_start = st.text_input("AI的开场白 (可选)", placeholder="Hey there! Enjoying the music?")
+
+                if st.form_submit_button("🚀 启动自定义情景"):
+                    if not custom_role or not custom_context:
+                        st.warning("请填写角色设定和场景描述哦！")
+                    else:
+                        sys_prompt = f"Role: {custom_role}. Context: {custom_context}. You must strictly stay in character."
+                        start_en = custom_start if custom_start else "Hello! Let's start our conversation based on the context."
+                        start_zh = "你好！我们基于设定的情景开始吧。"
+                        self._load_scenario(sys_prompt, start_en, start_zh, "自定义情景")
 
     def render_dictionary_tool(self):
-        """全局查词器组件 (使用 popover 实现弹出词典)"""
-        with st.popover("🔍 词典/查词"):
-            word = st.text_input("输入单词或词组：")
-            if word:
-                with st.spinner("查询中..."):
-                    res = EnglishAgents.dictionary_agent(word)
-                    if res:
-                        st.markdown(f"### {res['word']}  `{res['level']}`")
-                        st.write(f"🇬🇧 /{res['uk_phonetic']}/ | 🇺🇸 /{res['us_phonetic']}/")
-                        # 假设有个通用的发音按钮组件
-                        # st.audio(generate_audio_reply(res['word']))
-                        for m in res['meanings']:
-                            st.write(f"**{m['pos']}** {m['def']}")
+        """查词小工具 (极简弹窗 UI)"""
+        with st.popover("🔍 划词/查词", use_container_width=True):
+            st.markdown("**在线词典**")
+            with st.form("dict_search_form", clear_on_submit=False):
+                col_input, col_btn = st.columns([3, 1])
+                with col_input:
+                    word_query = st.text_input("输入英文单词或词组", label_visibility="collapsed")
+                with col_btn:
+                    submitted = st.form_submit_button("查询")
 
-    # def render_dictionary_tool(self):
-    #     """查词小工具 (极简弹窗 UI)"""
-    #     # st.popover 是一个按钮，点击后会弹出一个浮动窗口
-    #     with st.popover("🔍 划词/查词", use_container_width=True):
-    #         st.markdown("**在线词典**")
-    #
-    #         # 使用一个表单，防止每敲一个字母就触发查询
-    #         with st.form("dict_search_form", clear_on_submit=False):
-    #             col_input, col_btn = st.columns([3, 1])
-    #             with col_input:
-    #                 word_query = st.text_input("输入英文单词或词组", label_visibility="collapsed")
-    #             with col_btn:
-    #                 submitted = st.form_submit_button("查询")
-    #
-    #         if submitted and word_query:
-    #             with st.spinner("查询中..."):
-    #                 dict_data = lookup_word_youdao(word_query)
-    #
-    #             if dict_data:
-    #                 # ==========================================
-    #                 # UI 渲染：单词头 与 考试标签
-    #                 # ==========================================
-    #                 st.markdown(f"### {dict_data['word']}")
-    #
-    #                 if dict_data['exam_type']:
-    #                     # 将标签用 HTML 渲染成漂亮的小 Tag
-    #                     tags_html = " ".join([
-    #                                              f"<span style='background:#f0f2f6; padding:2px 8px; border-radius:10px; font-size:12px; color:#31333F;'>{tag}</span>"
-    #                                              for tag in dict_data['exam_type']])
-    #                     st.markdown(tags_html, unsafe_allow_html=True)
-    #
-    #                 st.divider()
-    #
-    #                 # ==========================================
-    #                 # UI 渲染：音标与发音按钮 (使用 Streamlit 原生音频播放)
-    #                 # ==========================================
-    #                 col_uk, col_us = st.columns(2)
-    #                 with col_uk:
-    #                     if dict_data['uk_phonetic']:
-    #                         st.caption(f"🇬🇧 英 `/{dict_data['uk_phonetic']}/`")
-    #                         if dict_data['uk_speech']:
-    #                             st.audio(dict_data['uk_speech'], format="audio/mp3")
-    #
-    #                 with col_us:
-    #                     if dict_data['us_phonetic']:
-    #                         st.caption(f"🇺🇸 美 `/{dict_data['us_phonetic']}/`")
-    #                         if dict_data['us_speech']:
-    #                             st.audio(dict_data['us_speech'], format="audio/mp3")
-    #
-    #                 st.write("")  # 换行留白
-    #
-    #                 # ==========================================
-    #                 # UI 渲染：核心释义
-    #                 # ==========================================
-    #                 if dict_data['explains']:
-    #                     for explain in dict_data['explains']:
-    #                         st.markdown(f"- {explain}")
-    #                 else:
-    #                     st.markdown(f"**翻译:** {', '.join(dict_data['translation'])}")
-    #
-    #                 st.divider()
-    #
-    #                 # ==========================================
-    #                 # 动作：收藏到生词本
-    #                 # ==========================================
-    #                 if st.button("⭐ 收藏到生词本", key=f"save_vocab_{dict_data['word']}", use_container_width=True):
-    #                     # 调用我们前面规划的数据库保存接口
-    #                     self.db.save_favorite(
-    #                         content=dict_data['word'],
-    #                         translation=dict_data['translation'][0],
-    #                         type="word"
-    #                     )
-    #                     st.success(f"已加入词汇库！")
-    #             else:
-    #                 st.error("未找到该词汇，请检查拼写或网络。")
+            if submitted and word_query:
+                with st.spinner("查询中..."):
+                    dict_data = lookup_word_youdao(word_query)
+
+                if dict_data:
+                    # logger.info(f"查词结果: {dict_data}")
+                    st.markdown(f"## {dict_data['word']}")
+
+                    # if dict_data['exam_type']:
+                    #     tags_html = " ".join([f"<span style='background:#f0f2f6; padding:2px 8px; border-radius:10px; font-size:12px; color:#31333F;'>{tag}</span>"
+                    #                              for tag in dict_data['exam_type']])
+                    #     st.markdown(tags_html, unsafe_allow_html=True)
+                    st.divider()
+                    # ==========================================
+                    # UI 渲染：音标与发音按钮 (使用 Streamlit 原生音频播放)
+                    # ==========================================
+                    col_uk, col_us = st.columns(2)
+                    with col_uk:
+                        if dict_data['uk_phonetic']:
+                            st.caption(f"🇬🇧 英 `/{dict_data['uk_phonetic']}/`")
+                            if dict_data['uk_speech']:
+                                st.audio(dict_data['uk_speech'], format="audio/mp3")
+                    with col_us:
+                        if dict_data['us_phonetic']:
+                            st.caption(f"🇺🇸 美 `/{dict_data['us_phonetic']}/`")
+                            if dict_data['us_speech']:
+                                st.audio(dict_data['us_speech'], format="audio/mp3")
+                    st.write("")  # 换行留白
+                    # ==========================================
+                    # UI 渲染：核心释义
+                    # ==========================================
+                    if dict_data['explains']:
+                        for explain in dict_data['explains']:
+                            st.markdown(f"- {explain}")
+                    else:
+                        st.markdown(f"**翻译:** {', '.join(dict_data['translation'])}")
+                    # st.divider()
+                    # ==========================================
+                    # 动作：收藏到生词本
+                    # ==========================================
+                    # if st.button("⭐ 收藏到生词本", key=f"save_vocab_{dict_data['word']}", use_container_width=True):
+                    #     self.db.save_favorite(
+                    #         content=dict_data['word'],
+                    #         translation=dict_data['translation'][0],
+                    #         type="word"
+                    #     )
+                    #     st.success(f"已加入词汇库！")
+                else:
+                    st.error("未找到该词汇，请检查拼写或网络。")
 
     def render_chat_tab(self):
         """核心板块一：对话UI渲染"""
-
         # 1. 顶部工具栏 (查词器)
         col1, col2 = st.columns([4, 1])
         with col2:
             self.render_dictionary_tool()
 
-        # 2. 渲染历史消息
+        # 2. 渲染历史消息 (🚨 重要：跳过 System 角色)
         for i, msg in enumerate(st.session_state.lingua_history):
-            if msg["role"] == "assistant":
+            if msg["role"] == "system":
+                continue  # 隐藏系统情景设定，不展示给用户
+            elif msg["role"] == "assistant":
                 self._render_ai_message(i, msg)
             else:
                 self._render_user_message(i, msg)
@@ -141,8 +199,9 @@ class EnglishLinguaApp:
             with col_h1:
                 if st.button("💡 需要提示?"):
                     with st.spinner("生成提示中..."):
-                        context = [{"role": m["role"], "content": m["content"]} for m in
-                                   st.session_state.lingua_history[-3:]]
+                        # 只取最近几条实际对话做提示，过滤 system
+                        context = [{"role": m["role"], "content": m["content_en"]}
+                                   for m in st.session_state.lingua_history[-3:] if m["role"] != "system"]
                         hints_data = EnglishAgents.hint_agent(context)
                         if hints_data:
                             st.session_state.hints = hints_data.get("hints", [])
@@ -374,17 +433,16 @@ class EnglishLinguaApp:
 
     def run(self):
         """主入口"""
+        if st.session_state.get("switch_to_chat"):
+            st.session_state.current_tab = "💬 对话"
+            st.session_state.switch_to_chat = False
         st.header("🗣️ 凌云语境 (Lingua-Scholar)")
+        st.radio("选择功能板块", ["💬 对话", "🎯 练习"], key="current_tab", horizontal=True)
 
-        # 顶级三大板块 Tab
-        tab_dialogue, tab_practice = st.tabs(["💬 对话", "🎯 练习"])
-
-        with tab_dialogue:
+        if st.session_state.current_tab == "💬 对话":
             self.render_chat_tab()
-
-        with tab_practice:
-            st.subheader("🎯 情景练习 (即将推出)")
-            st.write("通过插件式设计，这里未来可以载入：外贸口语、雅思Part2、会议Q&A等特定剧本。")
+        else:
+            self.render_practice_tab()
 
 # ======= 暴露给 main.py 的入口函数 =======
 def render_english_module():
