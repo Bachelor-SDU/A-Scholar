@@ -1,6 +1,6 @@
 # utils/nlp_agents.py
 import json
-from utils.llm_client import get_llm_response  # 假设这是您已有的通用LLM调用库
+from utils.llm_client import get_llm_response
 
 
 class EnglishAgents:

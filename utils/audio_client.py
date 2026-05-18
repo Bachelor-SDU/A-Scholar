@@ -19,70 +19,50 @@ from utils.logger import *
 
 if sys.platform == "win32":
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
 dashscope.api_key = st.secrets["DASHSCOPE_API_KEY"]
+STT_MODEL = st.secrets["STT_MODEL"]
+TTS_MODEL = st.secrets["TTS_MODEL"]
 
 
 # ---------------------------------------------------------
-# 1. STT: 语音转文字 (Agent 听你说)
+# 1. STT
 # ---------------------------------------------------------
 def transcribe_audio(audio_bytes):
-    """
-    使用阿里云 Paraformer
-    """
-
+    """Speech-to-Text"""
     if not audio_bytes:
         return None
-
     temp_path = None
-
     try:
         # 先读取浏览器录音
         audio = AudioSegment.from_file(io.BytesIO(audio_bytes))
-
         # 转成阿里云需要的格式
         audio = (
             audio
-            .set_frame_rate(16000)  # 16k
-            .set_channels(1)  # 单声道
-            .set_sample_width(2)  # 16bit PCM
+            .set_frame_rate(16000)
+            .set_channels(1)
+            .set_sample_width(2)
         )
-
         # 保存为真正标准 wav
-        with tempfile.NamedTemporaryFile(
-                delete=False,
-                suffix=".wav"
-        ) as f:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as f:
             audio.export(f.name, format="wav")
             temp_path = f.name
 
-        recognition = Recognition(model='paraformer-realtime-v2',
-                                  format='wav',
-                                  sample_rate=16000,
-                                  # “language_hints”只支持paraformer-realtime-v2模型
-                                  language_hints=['zh', 'en'],
-                                  callback=None)
-
+        recognition = Recognition(model=STT_MODEL, format='wav', sample_rate=16000, language_hints=['zh', 'en'], callback=None)
         result = recognition.call(temp_path)
 
         if result.status_code == HTTPStatus.OK:
-            logger.info(result)
-            logger.info(type(result))
-            logger.info(result.output)
+            # logger.info(result)
+            # logger.info(result.output)
             output = result.output or {}
-
             sentences = output.get("sentence", [])
-
             text_parts = []
-
             for s in sentences:
                 txt = s.get("text", "").strip()
                 if txt:
                     text_parts.append(txt)
-
             final_text = " ".join(text_parts).strip()
-
-            logger.info(f"ASR最终结果: {final_text}")
-
+            logger.info(f"ASR final result: {final_text}")
             return final_text if final_text else None
 
     finally:
@@ -91,7 +71,7 @@ def transcribe_audio(audio_bytes):
 
 
 # ---------------------------------------------------------
-# 2. TTS: 文字转语音 (Agent 回复你)
+# 2. TTS
 # ---------------------------------------------------------
 # 设置 API Key
 class TTSCallback(QwenTtsRealtimeCallback):
@@ -99,11 +79,11 @@ class TTSCallback(QwenTtsRealtimeCallback):
         self.audio_data = bytearray()
         self.complete_event = threading.Event()
 
-    def on_event(self, response: str) -> None:
+    def on_event(self, response: dict) -> None:
         try:
             msg_type = response.get('type')
+            # logger.info(response)
             if 'response.audio.delta' == msg_type:
-                # 累加收到的流式音频块
                 self.audio_data.extend(base64.b64decode(response['delta']))
             elif 'session.finished' == msg_type:
                 self.complete_event.set()
@@ -132,30 +112,23 @@ def generate_audio_reply(text, voice="Cherry"):
     模块化接口：封装阿里实时TTS
     """
     callback = TTSCallback()
-
     # 初始化实时连接
     tts_realtime = QwenTtsRealtime(
-        model='qwen3-tts-instruct-flash-realtime',
+        model=TTS_MODEL,
         callback=callback
     )
-
     try:
+        # Websocket connect
         tts_realtime.connect()
         tts_realtime.update_session(
             voice=voice,
             response_format=AudioFormat.PCM_24000HZ_MONO_16BIT,
             mode='server_commit'
         )
-
-        # 发送文本
         tts_realtime.append_text(text)
         tts_realtime.finish()
-
-        # 等待完成
         callback.wait_for_finished()
-        logger.success("✅ 实时语音合成完成，正在转换格式...")
-        # 此时 callback.audio_data 包含了完整的 PCM 数据
-        # 注意：这里返回的是 PCM，如果浏览器无法播放，可能需要转换成 WAV 或 MP3
+        # logger.success("✅ 实时语音合成完成，正在转换格式...")
         return pcm_to_wav(bytes(callback.audio_data))
 
     except Exception as e:

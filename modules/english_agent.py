@@ -3,8 +3,10 @@ import streamlit as st
 from audio_recorder_streamlit import audio_recorder
 
 from utils.nlp_agents import EnglishAgents, UserDataStore
-from utils.audio_client import transcribe_audio, generate_audio_reply  # 假设这是TTS/STT工具
+from utils.audio_client import transcribe_audio, generate_audio_reply
+from utils.dict_api import lookup_word_youdao
 from utils.logger import logger
+
 
 class EnglishLinguaApp:
     def __init__(self):
@@ -12,19 +14,17 @@ class EnglishLinguaApp:
         self.init_state()
 
     def init_state(self):
-        """初始化对话状态：无缝进入，AI先说话"""
         if "lingua_history" not in st.session_state:
             greeting_en = "Hey there! How's your day going?"
             greeting_zh = "嗨！今天过得怎么样？"
             audio_bytes = generate_audio_reply(greeting_en)
 
-            # 注意历史记录结构的改变：引入 content_en 和 content_zh
             st.session_state.lingua_history = [{
                 "role": "assistant",
                 "content_en": greeting_en,
                 "content_zh": greeting_zh,
                 "audio": audio_bytes,
-                "played": False  # 严格控制是否播放过
+                "played": False
             }]
             st.session_state.hints = []
             st.session_state.diagnostics = {}
@@ -46,6 +46,81 @@ class EnglishLinguaApp:
                         if st.button("⭐ 收藏", key=f"save_{word}"):
                             self.db.save_word(res)
                             st.toast(f"已收藏单词: {word}")
+    # def render_dictionary_tool(self):
+    #     """查词小工具 (极简弹窗 UI)"""
+    #     # st.popover 是一个按钮，点击后会弹出一个浮动窗口
+    #     with st.popover("🔍 划词/查词", use_container_width=True):
+    #         st.markdown("**在线词典**")
+    #
+    #         # 使用一个表单，防止每敲一个字母就触发查询
+    #         with st.form("dict_search_form", clear_on_submit=False):
+    #             col_input, col_btn = st.columns([3, 1])
+    #             with col_input:
+    #                 word_query = st.text_input("输入英文单词或词组", label_visibility="collapsed")
+    #             with col_btn:
+    #                 submitted = st.form_submit_button("查询")
+    #
+    #         if submitted and word_query:
+    #             with st.spinner("查询中..."):
+    #                 dict_data = lookup_word_youdao(word_query)
+    #
+    #             if dict_data:
+    #                 # ==========================================
+    #                 # UI 渲染：单词头 与 考试标签
+    #                 # ==========================================
+    #                 st.markdown(f"### {dict_data['word']}")
+    #
+    #                 if dict_data['exam_type']:
+    #                     # 将标签用 HTML 渲染成漂亮的小 Tag
+    #                     tags_html = " ".join([
+    #                                              f"<span style='background:#f0f2f6; padding:2px 8px; border-radius:10px; font-size:12px; color:#31333F;'>{tag}</span>"
+    #                                              for tag in dict_data['exam_type']])
+    #                     st.markdown(tags_html, unsafe_allow_html=True)
+    #
+    #                 st.divider()
+    #
+    #                 # ==========================================
+    #                 # UI 渲染：音标与发音按钮 (使用 Streamlit 原生音频播放)
+    #                 # ==========================================
+    #                 col_uk, col_us = st.columns(2)
+    #                 with col_uk:
+    #                     if dict_data['uk_phonetic']:
+    #                         st.caption(f"🇬🇧 英 `/{dict_data['uk_phonetic']}/`")
+    #                         if dict_data['uk_speech']:
+    #                             st.audio(dict_data['uk_speech'], format="audio/mp3")
+    #
+    #                 with col_us:
+    #                     if dict_data['us_phonetic']:
+    #                         st.caption(f"🇺🇸 美 `/{dict_data['us_phonetic']}/`")
+    #                         if dict_data['us_speech']:
+    #                             st.audio(dict_data['us_speech'], format="audio/mp3")
+    #
+    #                 st.write("")  # 换行留白
+    #
+    #                 # ==========================================
+    #                 # UI 渲染：核心释义
+    #                 # ==========================================
+    #                 if dict_data['explains']:
+    #                     for explain in dict_data['explains']:
+    #                         st.markdown(f"- {explain}")
+    #                 else:
+    #                     st.markdown(f"**翻译:** {', '.join(dict_data['translation'])}")
+    #
+    #                 st.divider()
+    #
+    #                 # ==========================================
+    #                 # 动作：收藏到生词本
+    #                 # ==========================================
+    #                 if st.button("⭐ 收藏到生词本", key=f"save_vocab_{dict_data['word']}", use_container_width=True):
+    #                     # 调用我们前面规划的数据库保存接口
+    #                     self.db.save_favorite(
+    #                         content=dict_data['word'],
+    #                         translation=dict_data['translation'][0],
+    #                         type="word"
+    #                     )
+    #                     st.success(f"已加入词汇库！")
+    #             else:
+    #                 st.error("未找到该词汇，请检查拼写或网络。")
 
     def render_chat_tab(self):
         """核心板块一：对话UI渲染"""
@@ -68,7 +143,6 @@ class EnglishLinguaApp:
             with col_h1:
                 if st.button("💡 需要提示?"):
                     with st.spinner("生成提示中..."):
-                        # 提取最近的上下文发给HintAgent
                         context = [{"role": m["role"], "content": m["content"]} for m in
                                    st.session_state.lingua_history[-3:]]
                         hints_data = EnglishAgents.hint_agent(context)
@@ -89,14 +163,10 @@ class EnglishLinguaApp:
         with st.chat_message("🎓"):
             st.markdown(f"**{msg['content_en']}**")
 
-            # 解决翻译问题：直接使用已经生成好的中文翻译
             if msg.get("content_zh"):
                 with st.popover("🌐 翻译"):
                     st.write(msg["content_zh"])
 
-            # 解决语音不稳定问题：
-            # 1. 永远显示原生播放器，确保即便autoplay失败用户也能自己点
-            # 2. 只有 played 为 False 时才触发 autoplay，触发后立即设为 True
             if msg.get("audio"):
                 should_autoplay = not msg.get("played", True)
                 st.audio(msg["audio"], format="audio/mp3", autoplay=should_autoplay)
@@ -105,7 +175,6 @@ class EnglishLinguaApp:
     def _render_user_message(self, index, msg):
         """渲染用户消息气泡 & 诊断面板"""
         with st.chat_message("👤"):
-            # 用户发的内容依然存在 content_en 里
             st.write(msg["content_en"])
 
             if index in st.session_state.diagnostics:
@@ -124,7 +193,6 @@ class EnglishLinguaApp:
                         st.audio(msg["audio"])
 
                     # --- Tab 2: 语法纠正 (视觉Diff) ---
-                    # 增加防御性判断，防止 correction 不存在报错
                     if diag.get("has_error") and diag.get('correction'):
                         st.markdown("### 🛠️ 语法纠正")
                         old = diag['correction'].get('old_text', '')
@@ -178,16 +246,13 @@ class EnglishLinguaApp:
         if text_input:
             user_text = text_input
 
-        # 【重要修复 2】: 判断这是否是一段"新"的录音 (比对长度)
         elif audio_bytes and len(audio_bytes) != st.session_state.last_audio_len:
             st.session_state.last_audio_len = len(audio_bytes)  # 更新记录
 
-            st.audio(audio_bytes)
             with st.spinner("Recognizing... (识别中)"):
                 user_text = transcribe_audio(audio_bytes)
                 user_audio = audio_bytes
 
-                # 【重要修复 3】: 如果阿里云没听清返回了空，给用户一个提示
                 if not user_text:
                     st.warning("⚠️ 未能识别到声音，请大点声或检查麦克风权限。")
                     user_text = None  # 确保为 None，不往下走
