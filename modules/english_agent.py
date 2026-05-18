@@ -157,6 +157,7 @@ class EnglishLinguaApp:
 
         # 4. 底部双模态输入区
         self._render_input_area()
+        self._process_agent_pipeline()
 
     def _render_ai_message(self, index, msg):
         """渲染AI的消息气泡"""
@@ -258,50 +259,134 @@ class EnglishLinguaApp:
                     user_text = None  # 确保为 None，不往下走
 
         if user_text:
-            # 1. 存入历史
-            self.db.state.vocab_bank.update(user_text)
             st.session_state.lingua_history.append({
                 "role": "user",
                 "content_en": user_text,
                 "audio": user_audio
             })
-            current_idx = len(st.session_state.lingua_history) - 1
-            st.session_state.hints = []
 
-            # 2. 提取给LLM的上下文
-            history_for_chat = []
-            for m in st.session_state.lingua_history[:-1]:
-                history_for_chat.append({"role": m["role"], "content": m["content_en"]})
-            history_for_chat.append({"role": "user", "content": user_text})
-
-            # 3. 调用 ChatAgent 获取回复
-            with st.spinner("Thinking..."):
-                reply_data = EnglishAgents.chat_agent(history_for_chat)
-
-            if reply_data and "reply_en" in reply_data:
-                reply_en = reply_data["reply_en"]
-                reply_zh = reply_data.get("reply_zh", "翻译生成失败")
-            else:
-                reply_en = "Sorry, I didn't quite catch that. Could you say it again?"
-                reply_zh = "抱歉，我没听清楚，你能再说一遍吗？"
-
-            with st.spinner("Generating Voice..."):
-                reply_audio = generate_audio_reply(reply_en, "Cherry")
-
-            st.session_state.lingua_history.append({
-                "role": "assistant",
-                "content_en": reply_en,
-                "content_zh": reply_zh,
-                "audio": reply_audio,
-                "played": False
-            })
-
-            # 4. 调用 DiagnosticAgent
-            diag_res = EnglishAgents.diagnostic_agent(user_text, history_for_chat)
-            if diag_res:
-                st.session_state.diagnostics[current_idx] = diag_res
+            st.session_state.pending_user_text = user_text
+            st.session_state.agent_stage = "waiting_llm"
 
             st.rerun()
+
+    def _process_agent_pipeline(self):
+
+        stage = st.session_state.get("agent_stage")
+
+        if not stage:
+            return
+
+        # =========================
+        # 第一阶段：生成AI文字
+        # =========================
+        if stage == "waiting_llm":
+
+            with st.spinner("Thinking..."):
+
+                user_text = st.session_state.pending_user_text
+
+                history_for_chat = []
+
+                for m in st.session_state.lingua_history:
+                    history_for_chat.append({
+                        "role": m["role"],
+                        "content": m["content_en"]
+                    })
+
+                reply_data = EnglishAgents.chat_agent(history_for_chat)
+
+                if reply_data and "reply_en" in reply_data:
+                    reply_en = reply_data["reply_en"]
+                    reply_zh = reply_data.get("reply_zh", "")
+                else:
+                    reply_en = "Sorry, I didn't quite catch that."
+                    reply_zh = "抱歉，我没听清。"
+
+                # 先插入“纯文字AI消息”
+                st.session_state.lingua_history.append({
+                    "role": "assistant",
+                    "content_en": reply_en,
+                    "content_zh": reply_zh,
+                    "audio": None,
+                    "played": False
+                })
+
+                # 保存供后续TTS使用
+                st.session_state.pending_reply_en = reply_en
+
+                # 下一阶段
+                st.session_state.agent_stage = "waiting_tts"
+
+                st.rerun()
+        # =========================
+        # 第二阶段：生成TTS
+        # =========================
+        elif stage == "waiting_tts":
+
+            with st.spinner("Generating Voice..."):
+
+                reply_en = st.session_state.pending_reply_en
+
+                try:
+                    reply_audio = generate_audio_reply(
+                        reply_en,
+                        "Cherry"
+                    )
+                except Exception as e:
+                    logger.error(f"TTS失败: {e}")
+                    reply_audio = None
+
+                # 更新最后一条AI消息
+                st.session_state.lingua_history[-1]["audio"] = reply_audio
+
+                # 下一阶段
+                st.session_state.agent_stage = "waiting_diag"
+
+                st.rerun()
+        # =========================
+        # 第三阶段：诊断
+        # =========================
+        elif stage == "waiting_diag":
+
+            with st.spinner("Analyzing Grammar..."):
+
+                try:
+
+                    user_index = None
+
+                    for i in range(len(st.session_state.lingua_history) - 1, -1, -1):
+                        if st.session_state.lingua_history[i]["role"] == "user":
+                            user_index = i
+                            break
+
+                    if user_index is not None:
+
+                        user_text = st.session_state.lingua_history[user_index]["content_en"]
+
+                        history_for_chat = []
+
+                        for m in st.session_state.lingua_history:
+                            history_for_chat.append({
+                                "role": m["role"],
+                                "content": m["content_en"]
+                            })
+
+                        diag_res = EnglishAgents.diagnostic_agent(
+                            user_text,
+                            history_for_chat
+                        )
+
+                        if diag_res:
+                            st.session_state.diagnostics[user_index] = diag_res
+
+                except Exception as e:
+                    logger.error(f"诊断失败: {e}")
+
+                # 全部完成
+                st.session_state.agent_stage = None
+
+                st.rerun()
 
     def run(self):
         """主入口"""
