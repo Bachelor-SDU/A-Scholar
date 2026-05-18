@@ -11,7 +11,6 @@ from utils.logger import logger
 
 class EnglishLinguaApp:
     def __init__(self):
-        self.db = UserDataStore(st.session_state)
         self.init_state()
 
     def init_state(self):
@@ -44,9 +43,7 @@ class EnglishLinguaApp:
                         # st.audio(generate_audio_reply(res['word']))
                         for m in res['meanings']:
                             st.write(f"**{m['pos']}** {m['def']}")
-                        if st.button("⭐ 收藏", key=f"save_{word}"):
-                            self.db.save_word(res)
-                            st.toast(f"已收藏单词: {word}")
+
     # def render_dictionary_tool(self):
     #     """查词小工具 (极简弹窗 UI)"""
     #     # st.popover 是一个按钮，点击后会弹出一个浮动窗口
@@ -276,199 +273,111 @@ class EnglishLinguaApp:
             st.rerun()
 
     def _process_agent_pipeline(self):
-
         stage = st.session_state.get("agent_stage")
-
         if not stage:
             return
 
-        # =========================
-        # 第一阶段：生成AI文字
-        # =========================
         if stage == "waiting_llm":
-
+            # 采用合并状态：一次性处理所有后台任务，体验更紧凑流畅
             with st.spinner("Thinking..."):
-
                 user_text = st.session_state.pending_user_text
 
-                history_for_chat = []
+                # 1. 准备历史对话数据 (包含用户刚刚发送的消息)
+                history_for_chat = [
+                    {"role": m["role"], "content": m["content_en"]}
+                    for m in st.session_state.lingua_history
+                ]
 
-                for m in st.session_state.lingua_history:
-                    history_for_chat.append({
-                        "role": m["role"],
-                        "content": m["content_en"]
-                    })
-
-                reply_data = EnglishAgents.chat_agent(history_for_chat)
-
-                if reply_data and "reply_en" in reply_data:
-                    reply_en = reply_data["reply_en"]
-                    reply_zh = reply_data.get("reply_zh", "")
-                else:
-                    reply_en = "Sorry, I didn't quite catch that."
-                    reply_zh = "抱歉，我没听清。"
-
-                # 先插入“纯文字AI消息”
-                st.session_state.lingua_history.append({
-                    "role": "assistant",
-                    "content_en": reply_en,
-                    "content_zh": reply_zh,
-                    "audio": None,
-                    "played": False
-                })
-
-                # 保存供后续TTS使用
-                st.session_state.pending_reply_en = reply_en
-
-                # 下一阶段
-                st.session_state.agent_stage = "waiting_background_tasks"
-
-                st.rerun()
-        # =========================
-        # 第二阶段：生成TTS
-        # =========================
-        elif stage == "waiting_background_tasks":
-
-            with st.spinner("Finishing response..."):
-
-                reply_en = st.session_state.pending_reply_en
-
-                # 找最近用户消息
-                user_text = None
-
-                for i in range(len(st.session_state.lingua_history) - 1, -1, -1):
-                    if st.session_state.lingua_history[i]["role"] == "user":
-                        user_text = st.session_state.lingua_history[i]["content_en"]
-                        user_index = i
-                        break
-
-                history_for_chat = []
-
-                for m in st.session_state.lingua_history:
-                    history_for_chat.append({
-                        "role": m["role"],
-                        "content": m["content_en"]
-                    })
+                # 确定当前用户消息在历史记录中的索引（用于绑定诊断结果）
+                user_index = len(st.session_state.lingua_history) - 1
 
                 # =========================
-                # 并行执行
+                # 🚀 核心优化：高并发执行流水线
                 # =========================
+                with ThreadPoolExecutor(max_workers=3) as executor:
 
-                with ThreadPoolExecutor(max_workers=2) as executor:
-
-                    future_tts = executor.submit(
-                        self._run_tts_task,
-                        reply_en
-                    )
-
+                    # 💥 优化点1：立即派发【诊断任务】（它只依赖用户文本，不需要等AI回答）
                     future_diag = executor.submit(
                         self._run_diag_task,
                         user_text,
                         history_for_chat
                     )
 
-                    # 获取结果
+                    # 💥 优化点2：立即派发【对话任务】
+                    future_chat = executor.submit(
+                        EnglishAgents.chat_agent,
+                        history_for_chat
+                    )
+
+                    # ⏳ 阻塞：等待【对话任务】完成（最耗时的部分，约2秒）
+                    reply_data = future_chat.result()
+
+                    if reply_data and "reply_en" in reply_data:
+                        reply_en = reply_data["reply_en"]
+                        reply_zh = reply_data.get("reply_zh", "")
+                    else:
+                        reply_en = "Sorry, I didn't quite catch that."
+                        reply_zh = "抱歉，我没听清。"
+
+                    # 💥 优化点3：对话文本一出来，立刻派发【TTS语音任务】
+                    future_tts = executor.submit(
+                        self._run_tts_task,
+                        reply_en
+                    )
+
+                    # ⏳ 等待剩余收尾工作：
+                    # 此时【诊断任务】因为是和【对话任务】同时起跑的，现在大概率已经完成了！
+                    # 【TTS任务】通常只需几百毫秒，所以这里几乎是秒过。
+                    diag_res = future_diag.result()
                     reply_audio = future_tts.result()
 
-                    diag_res = future_diag.result()
-
                 # =========================
-                # 更新TTS
+                # 数据统合与 UI 刷新
                 # =========================
-
-                st.session_state.lingua_history[-1]["audio"] = reply_audio
-
-                # =========================
-                # 更新诊断
-                # =========================
-
+                # 1. 保存诊断结果
                 if diag_res:
                     st.session_state.diagnostics[user_index] = diag_res
 
-                # 完成
+                # 2. 插入带有语音的完整AI消息
+                st.session_state.lingua_history.append({
+                    "role": "assistant",
+                    "content_en": reply_en,
+                    "content_zh": reply_zh,
+                    "audio": reply_audio,
+                    "played": False
+                })
+
+                # 3. 清理状态并刷新页面
                 st.session_state.agent_stage = None
+                st.session_state.pending_user_text = None
 
                 st.rerun()
 
     def _run_tts_task(self, reply_en):
-
         try:
             audio = generate_audio_reply(reply_en, "Cherry")
             return audio
-
         except Exception as e:
             logger.error(f"TTS失败: {e}")
             return None
 
     def _run_diag_task(self, user_text, history):
-
         try:
             diag_res = EnglishAgents.diagnostic_agent(
                 user_text,
                 history
             )
             return diag_res
-
         except Exception as e:
             logger.error(f"Diagnostic失败: {e}")
             return None
-
-    def _poll_background_tasks(self):
-
-        # =========================
-        # 检查 TTS
-        # =========================
-
-        tts_future = st.session_state.get("tts_future")
-
-        if tts_future and tts_future.done():
-
-            try:
-                audio = tts_future.result()
-
-                idx = st.session_state.tts_target_index
-
-                # 仅更新一次
-                if (
-                        st.session_state.lingua_history[idx]["audio"]
-                        is None
-                ):
-                    st.session_state.lingua_history[idx]["audio"] = audio
-
-            except Exception as e:
-                logger.error(f"TTS Future失败: {e}")
-
-            finally:
-                st.session_state.tts_future = None
-
-        # =========================
-        # 检查 Diagnostic
-        # =========================
-
-        diag_future = st.session_state.get("diag_future")
-
-        if diag_future and diag_future.done():
-
-            try:
-                diag_res = diag_future.result()
-
-                idx = st.session_state.diag_target_index
-
-                if diag_res:
-                    st.session_state.diagnostics[idx] = diag_res
-
-            except Exception as e:
-                logger.error(f"Diagnostic Future失败: {e}")
-
-            finally:
-                st.session_state.diag_future = None
 
     def run(self):
         """主入口"""
         st.header("🗣️ 凌云语境 (Lingua-Scholar)")
 
         # 顶级三大板块 Tab
-        tab_dialogue, tab_practice, tab_review = st.tabs(["💬 对话", "🎯 练习", "📚 回顾"])
+        tab_dialogue, tab_practice = st.tabs(["💬 对话", "🎯 练习"])
 
         with tab_dialogue:
             self.render_chat_tab()
@@ -476,19 +385,6 @@ class EnglishLinguaApp:
         with tab_practice:
             st.subheader("🎯 情景练习 (即将推出)")
             st.write("通过插件式设计，这里未来可以载入：外贸口语、雅思Part2、会议Q&A等特定剧本。")
-
-        with tab_review:
-            st.subheader("📚 学习回顾")
-            c1, c2, c3 = st.columns(3)
-            c1.metric("已掌握词汇", len(self.db.state.vocab_bank))
-            c2.metric("收藏句子", len(self.db.state.favorites["sentences"]))
-            c3.metric("错题记录", len(self.db.state.mistakes))
-
-            st.write("---")
-            st.write("**错题本示例:**")
-            for m in self.db.state.mistakes:
-                st.error(f"❌ {m['original']} \n\n ✅ {m['corrected']}")
-
 
 # ======= 暴露给 main.py 的入口函数 =======
 def render_english_module():

@@ -107,6 +107,7 @@ def pcm_to_wav(pcm_data):
     return wav_io.getvalue()
 
 
+@log_execution_time
 def generate_audio_reply(text, voice="Cherry"):
     """
     模块化接口：封装阿里实时TTS
